@@ -1,4 +1,5 @@
-Resource/lenta-ru-news.csv
+Resource/*csv
+Resource/*parquet
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
