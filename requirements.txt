@@ -14,6 +14,10 @@ nltk
 pymorphy3
 wordcloud
 
+# Обработка сайтов
+requests
+BeautifulSoup4
+
 # Оптимизация процессов
 pandarallel
 ipywidgets
