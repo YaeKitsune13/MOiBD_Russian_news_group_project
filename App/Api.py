@@ -1,286 +1,228 @@
-# api.py - оптимизированная версия (без загрузки всего датасета в RAM)
-import os
 import re
 import json
-import random
 import joblib
 import numpy as np
 import pandas as pd
-import nltk
 import uvicorn
 import pymorphy3
+import nltk
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
+from pathlib import Path
+import random
 
-# ---------- Configuration ----------
-MODELS_DIR = "../Models"
-DATA_DIR = "../Resource"
-CSV_FILE = "lenta-ru-news.csv"
-STATS_FILE = os.path.join(DATA_DIR, "stats_cache.json")
-EXT = "pkl"
-TFIDF_EXT = "prek"
-
-# ---------- Stop words & lemmatization ----------
-nltk.download('stopwords', quiet=True)
-RUSSIAN_STOP_WORDS = set(stopwords.words('russian'))
-RUSSIAN_STOP_WORDS.update({
-    'также', 'однако', 'который', 'это', 'собственный', 'сообщать', 'заявить',
-    'ранее', 'свой', 'весь', 'мочь', 'стать', 'время', 'год', 'слово', 'новость',
-    'отметить', 'рассказать', 'получить', 'являться', 'назвать', 'говорить',
-    'частности', 'именно', 'поскольку', 'кроме', 'находиться', 'сообщается',
-    'российский', 'россия', 'рф', 'москва'
-})
-
-morph = pymorphy3.MorphAnalyzer()
-_cache = {}
-
-def clean_and_lemmatize(text: str) -> str:
-    if not isinstance(text, str):
-        return ''
-    words = re.findall(r'[а-яёa-z]+', text.lower())
-    result = []
-    for w in words:
-        if w in RUSSIAN_STOP_WORDS or len(w) < 3:
-            continue
-        if w not in _cache:
-            _cache[w] = morph.parse(w)[0].normal_form
-        lemma = _cache[w]
-        if lemma not in RUSSIAN_STOP_WORDS and len(lemma) >= 3:
-            result.append(lemma)
-    return ' '.join(result)
-
-# ---------- Load models & vectorizer ----------
-print("Loading label encoder...")
-le = joblib.load(os.path.join(MODELS_DIR, f"label_encoder.{EXT}"))
-
-print("Loading TF-IDF vectorizer...")
-vec_path = os.path.join(MODELS_DIR, f"tfidf_vectorizer.{TFIDF_EXT}")
-if not os.path.exists(vec_path):
-    vec_path = os.path.join(MODELS_DIR, f"tfidf_vectorizer.{EXT}")
-tfidf = joblib.load(vec_path)
-
-model_files = {
-    "Logistic Regression": "model_logistic_regression.pkl",
-    "Naive Bayes": "model_naive_bayes.pkl",
-    "Linear SVC": "model_linear_svc.pkl",
-    "Final SVC (self-trained)": "final_svc_self_trained.pkl"
-}
+APP_DIR = Path(__file__).resolve().parent
+ROOT_DIR = APP_DIR.parent
+MODELS_DIR = ROOT_DIR / "Models"
+DATA_DIR = ROOT_DIR / "Resource"
+CSV_FILE = DATA_DIR / "lenta-ru-news.csv"
+STATS_FILE = DATA_DIR / "stats_cache.json"
+ARTICLES_FILE = DATA_DIR / "articles_cache.json"
 
 models = {}
-accuracy_scores = {
-    "Logistic Regression": 0.8174,
-    "Naive Bayes": 0.7800,
-    "Linear SVC": 0.8352,
-    "Final SVC (self-trained)": 0.8427,
-}
+tfidf = None
+le = None
+stats_cache = {}
+articles_cache = []  # все статьи в памяти, грузятся один раз
 
-for name, fname in model_files.items():
-    path = os.path.join(MODELS_DIR, fname)
-    if os.path.exists(path):
-        models[name] = joblib.load(path)
-        print(f"Loaded {name}")
+morph = pymorphy3.MorphAnalyzer()
+nltk.download('stopwords', quiet=True)
+STOP_WORDS = set(stopwords.words('russian'))
 
-if not models:
-    raise RuntimeError("No models loaded. Check MODELS_DIR and file names.")
 
-# ---------- Precompute statistics (only once) ----------
-def compute_statistics():
-    """Читает CSV по частям, вычисляет статистику и сохраняет в JSON."""
-    csv_path = os.path.join(DATA_DIR, CSV_FILE)
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV not found at {csv_path}")
+def clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r'[^а-яё ]', '', text.lower())
+    return " ".join([
+        morph.parse(w)[0].normal_form
+        for w in text.split()
+        if w not in STOP_WORDS and len(w) > 2
+    ])
 
-    total_articles = 0
-    unique_topics = set()
-    topic_counts = {}
-    len_chars_list = []
-    len_words_list = []
-    date_min = None
-    date_max = None
 
-    # Читаем CSV чанками по 50k строк
-    chunk_iter = pd.read_csv(csv_path, usecols=['title', 'text', 'topic', 'date'],
-                             chunksize=50000, low_memory=False)
-    for chunk in chunk_iter:
-        # Объединяем title + text
-        full_text = chunk['title'].fillna('') + ' ' + chunk['text'].fillna('')
-        len_chars = full_text.str.len()
-        len_words = full_text.str.split().str.len()
-        len_chars_list.extend(len_chars.tolist())
-        len_words_list.extend(len_words.tolist())
+def load_models():
+    global tfidf, le, models
+    try:
+        le_path = MODELS_DIR / "label_encoder.pkl"
+        if le_path.exists():
+            le = joblib.load(le_path)
 
-        # Топики
-        for topic in chunk['topic'].dropna():
-            unique_topics.add(topic)
-            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        v_path = MODELS_DIR / "tfidf_vectorizer.prek"
+        if not v_path.exists():
+            v_path = MODELS_DIR / "tfidf_vectorizer.pkl"
+        if v_path.exists():
+            tfidf = joblib.load(v_path)
 
-        # Даты
-        dates = pd.to_datetime(chunk['date'], errors='coerce')
-        if date_min is None:
-            date_min = dates.min()
-            date_max = dates.max()
-        else:
-            date_min = min(date_min, dates.min())
-            date_max = max(date_max, dates.max())
+        m_files = {
+            "Logistic Regression": "model_logistic_regression.pkl",
+            "Naive Bayes": "model_naive_bayes.pkl",
+            "Linear SVC": "model_linear_svc.pkl",
+            "Final SVC (self-trained)": "final_svc_self_trained.pkl",
+        }
+        for name, fname in m_files.items():
+            p = MODELS_DIR / fname
+            if p.exists():
+                models[name] = joblib.load(p)
+                print(f"✅ {name} loaded.")
+    except Exception as e:
+        print(f"❌ Load error: {e}")
 
-        total_articles += len(chunk)
-        # Не держим chunk в памяти
-        del chunk, full_text, len_chars, len_words, dates
 
-    # Вычисляем статистику
-    avg_chars = int(np.mean(len_chars_list))
-    avg_words = int(np.mean(len_words_list))
-    min_chars = int(np.min(len_chars_list))
-    max_chars = int(np.max(len_chars_list))
-    median_chars = int(np.median(len_chars_list))
-    min_words = int(np.min(len_words_list))
-    max_words = int(np.max(len_words_list))
-    median_words = int(np.median(len_words_list))
+def load_articles():
+    """Грузит статьи один раз при старте и кэширует в JSON."""
+    global articles_cache
+    if ARTICLES_FILE.exists():
+        print("📦 Loading articles from cache...")
+        with open(ARTICLES_FILE, 'r', encoding='utf-8') as f:
+            articles_cache = json.load(f)
+        print(f"✅ {len(articles_cache)} articles loaded from cache.")
+        return
 
-    stats = {
-        "total_articles": total_articles,
-        "unique_topics": len(unique_topics),
-        "average_text_length_chars": avg_chars,
-        "average_text_length_words": avg_words,
-        "topic_distribution": topic_counts,
-        "date_range": {
-            "min": date_min.strftime('%Y-%m-%d') if date_min else "N/A",
-            "max": date_max.strftime('%Y-%m-%d') if date_max else "N/A"
-        },
-        "min_length_chars": min_chars,
-        "max_length_chars": max_chars,
-        "median_length_chars": median_chars,
-        "min_length_words": min_words,
-        "max_length_words": max_words,
-        "median_length_words": median_words
+    if not CSV_FILE.exists():
+        print("❌ CSV not found")
+        return
+
+    print("⏳ Reading articles from CSV (first time only)...")
+    try:
+        df = pd.read_csv(CSV_FILE, low_memory=False, on_bad_lines='skip')
+        df = df[['title', 'text', 'topic']].dropna()
+        # Берём 2000 случайных статей — этого хватит, не надо хранить всё
+        sample = df.sample(n=min(2000, len(df)))
+        articles_cache = sample.rename(columns={"topic": "true_topic"}).to_dict(orient="records")
+        with open(ARTICLES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(articles_cache, f, ensure_ascii=False)
+        print(f"✅ {len(articles_cache)} articles cached.")
+    except Exception as e:
+        print(f"❌ Articles load error: {e}")
+
+
+def get_stats():
+    global stats_cache
+    if STATS_FILE.exists():
+        print("📦 Loading stats from cache...")
+        with open(STATS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    if not CSV_FILE.exists():
+        return {"error": "CSV missing"}
+
+    print("⏳ Processing CSV for stats (first time only)...")
+    df = pd.read_csv(CSV_FILE, usecols=['topic', 'date', 'text', 'title'], low_memory=False)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['wc'] = (df['title'].fillna('').str.len().div(5) + df['text'].fillna('').str.len().div(5)).astype(int)
+
+    yearly = df['date'].dt.year.dropna().astype(int).value_counts().sort_index().to_dict()
+    topic_dist = df['topic'].value_counts().to_dict()
+    avg_len = df.groupby('topic')['wc'].mean().round(1).to_dict()
+    monthly = (
+        df.dropna(subset=['date'])
+        .groupby(df['date'].dt.to_period('M').astype(str))
+        .size()
+        .to_dict()
+    )
+
+    stats_cache = {
+        "total_articles": int(len(df)),
+        "unique_topics": int(df['topic'].nunique()),
+        "average_text_length_words": int(df['wc'].mean()),
+        "topic_distribution": {str(k): int(v) for k, v in topic_dist.items()},
+        "avg_length_per_topic": {str(k): float(v) for k, v in avg_len.items()},
+        "yearly_distribution": {int(k): int(v) for k, v in yearly.items()},
+        "monthly_distribution": {str(k): int(v) for k, v in monthly.items()},
+        "word_count_raw": df['wc'].sample(n=min(2000, len(df))).tolist(),
     }
 
     with open(STATS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+        json.dump(stats_cache, f, ensure_ascii=False)
 
-    return stats
+    print("✅ Stats cached.")
+    return stats_cache
 
-# Загружаем или вычисляем статистику
-if os.path.exists(STATS_FILE):
-    print("Loading cached statistics...")
-    with open(STATS_FILE, 'r', encoding='utf-8') as f:
-        stats_cache = json.load(f)
-    # Конвертируем ключи topic_distribution обратно в int (JSON сохраняет как строки)
-    stats_cache["topic_distribution"] = {k: int(v) for k, v in stats_cache["topic_distribution"].items()}
-    stats_cache["total_articles"] = int(stats_cache["total_articles"])
-    stats_cache["unique_topics"] = int(stats_cache["unique_topics"])
-else:
-    print("Computing statistics (this may take a few minutes)...")
-    stats_cache = compute_statistics()
-    print("Statistics saved to JSON.")
 
-# ---------- Функция для получения случайных новостей без загрузки всего CSV ----------
-def get_random_articles(limit=50):
-    """Читает случайные строки из CSV, не загружая весь файл."""
-    csv_path = os.path.join(DATA_DIR, CSV_FILE)
-    # Сначала узнаем общее количество строк (без заголовка)
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        total_lines = sum(1 for _ in f) - 1
-    # Выбираем случайные индексы
-    if limit > total_lines:
-        limit = total_lines
-    random_indices = sorted(random.sample(range(1, total_lines + 1), limit))
-    # Читаем только нужные строки
-    rows = []
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        # Пропускаем заголовок
-        f.readline()
-        current_idx = 1
-        for line in f:
-            if current_idx in random_indices:
-                parts = line.strip().split(',')
-                # Очень грубый split – для простоты. Лучше использовать csv.reader, но это быстрее.
-                # Упростим: возьмём первые 4 столбца (title, text, topic, date)
-                # На самом деле CSV может содержать запятые внутри, но для демонстрации сойдёт.
-                title = parts[0].strip('"') if len(parts) > 0 else ""
-                text = parts[1].strip('"') if len(parts) > 1 else ""
-                topic = parts[3].strip('"') if len(parts) > 3 else ""
-                rows.append({"title": title, "text": text[:500] + "..." if len(text) > 500 else text, "true_topic": topic})
-            current_idx += 1
-            if len(rows) == limit:
-                break
-    return rows
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_models()
+    global stats_cache
+    stats_cache = get_stats()
+    load_articles()  # грузим статьи в память при старте
+    yield
 
-# ---------- FastAPI app ----------
-app = FastAPI(title="News Classifier API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 class PredictRequest(BaseModel):
     model_name: str
     text: str
 
-class PredictResponse(BaseModel):
-    model_name: str
-    predicted_category: str
-    confidence: float
-    all_probabilities: dict
 
 @app.get("/models")
 def get_models():
-    return [{"name": name, "accuracy": accuracy_scores.get(name, 0.0)} for name in models.keys()]
+    return [{"name": k} for k in models.keys()]
 
-@app.post("/predict")
-def predict(request: PredictRequest):
-    if request.model_name not in models:
-        raise HTTPException(status_code=404, detail="Model not found")
-    model = models[request.model_name]
-    lemmatized = clean_and_lemmatize(request.text)
-    if not lemmatized:
-        raise HTTPException(status_code=400, detail="Text after preprocessing is empty")
-    X = tfidf.transform([lemmatized])
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)[0]
-    else:
-        proba = np.zeros(len(le.classes_))
-        proba[model.predict(X)[0]] = 1.0
-    pred_idx = np.argmax(proba)
-    pred_category = le.inverse_transform([pred_idx])[0]
-    all_probs = {cat: float(proba[i]) for i, cat in enumerate(le.classes_)}
-    return PredictResponse(
-        model_name=request.model_name,
-        predicted_category=pred_category,
-        confidence=float(proba[pred_idx]),
-        all_probabilities=all_probs
-    )
 
 @app.get("/stats/overview")
 def overview():
     return stats_cache
 
-@app.get("/sample_articles")
-def sample_articles(limit: int = 50):
-    try:
-        articles = get_random_articles(min(limit, 100))  
-        return {"articles": articles}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading CSV: {e}")
 
-@app.get("/help")
-def help_endpoint():
+@app.get("/sample_articles")
+def samples(limit: int = 50):
+    if not articles_cache:
+        return {"articles": []}
+    n = min(limit, len(articles_cache))
+    return {"articles": random.sample(articles_cache, n)}
+
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    if not models:
+        raise HTTPException(status_code=503, detail="Модели не загружены")
+    if tfidf is None:
+        raise HTTPException(status_code=503, detail="Векторайзер не загружен")
+    if req.model_name not in models:
+        raise HTTPException(status_code=404, detail=f"Модель '{req.model_name}' не найдена")
+
+    cleaned = clean_text(req.text)
+    if not cleaned.strip():
+        raise HTTPException(status_code=400, detail="Текст пустой после очистки")
+
+    vec = tfidf.transform([cleaned])
+    model = models[req.model_name]
+    pred_idx = model.predict(vec)[0]
+    category = le.inverse_transform([pred_idx])[0] if le else str(pred_idx)
+
+    confidence = None
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(vec)[0]
+        confidence = float(np.max(proba))
+    elif hasattr(model, "decision_function"):
+        scores = model.decision_function(vec)[0]
+        shifted = scores - scores.min()
+        total = shifted.sum()
+        if total > 0:
+            confidence = float(shifted.max() / total)
+
+    all_probs = None
+    if le is not None and hasattr(model, "predict_proba"):
+        proba = model.predict_proba(vec)[0]
+        all_probs = {
+            str(le.inverse_transform([i])[0]): round(float(p), 4)
+            for i, p in enumerate(proba)
+        }
+
     return {
-        "description": "API for Russian news topic classification",
-        "endpoints": [
-            "GET /models – list available models with accuracy",
-            "POST /predict – classify a news article",
-            "GET /stats/overview – dataset statistics",
-            "GET /sample_articles – get random news samples",
-            "GET /help – this help message"
-        ]
+        "category": category,
+        "confidence": confidence,
+        "all_probabilities": all_probs,
+        "model_used": req.model_name,
     }
 
+
 if __name__ == "__main__":
-    uvicorn.run("Api:app", host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

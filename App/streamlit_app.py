@@ -1,160 +1,146 @@
-# streamlit_app.py
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Lenta.ru Analytics", layout="wide")
 
 API_URL = "http://localhost:8000"
 
-st.set_page_config(page_title="Классификатор новостей", layout="wide")
-st.title("Классификатор новостей Lenta.ru")
-st.markdown("Выберите новость из списка и модели для сравнения")
-
-# ---------- Загрузка списка моделей ----------
-@st.cache_data(ttl=600)
-def get_models():
+@st.cache_data(ttl=60)
+def get_api(endpoint, params=None):
     try:
-        resp = requests.get(f"{API_URL}/models")
-        resp.raise_for_status()
-        return resp.json()
+        r = requests.get(f"{API_URL}/{endpoint}", params=params, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        return None
     except:
-        st.error("Не удалось подключиться к API. Запустите FastAPI на порту 8000.")
-        return []
-
-# ---------- Загрузка примеров новостей ----------
-@st.cache_data(ttl=3600)
-def get_sample_articles(limit=100):
-    try:
-        resp = requests.get(f"{API_URL}/sample_articles", params={"limit": limit})
-        resp.raise_for_status()
-        return resp.json()["articles"]
-    except:
-        st.error("Не удалось загрузить образцы новостей.")
-        return []
-
-# ---------- Загрузка статистики датасета ----------
-@st.cache_data(ttl=3600)
-def get_statistics():
-    try:
-        resp = requests.get(f"{API_URL}/stats/overview")
-        resp.raise_for_status()
-        return resp.json()
-    except:
-        st.error("Не удалось загрузить статистику.")
         return None
 
-models_info = get_models()
-if not models_info:
+stats = get_api("stats/overview")
+models_list = get_api("models") or []
+articles_resp = get_api("sample_articles", {"limit": 100})
+articles = articles_resp.get("articles", []) if articles_resp else []
+
+st.title("Lenta.ru — анализ новостей")
+
+if stats is None:
+    st.error("API недоступен. Запустите python Api.py")
     st.stop()
 
-articles = get_sample_articles(limit=100)
-if not articles:
-    st.stop()
+# --- Метрики ---
+col1, col2, col3 = st.columns(3)
+col1.metric("Всего статей", f"{stats.get('total_articles', 0):,}")
+col2.metric("Рубрик", stats.get('unique_topics', 0))
+col3.metric("Средняя длина (слов)", stats.get('average_text_length_words', 0))
 
-# ---------- Основные вкладки ----------
-tab1, tab2 = st.tabs(["Сравнение моделей", "Статистика датасета"])
+st.divider()
 
-# ----- Вкладка 1: Сравнение моделей -----
-with tab1:
-    st.subheader("Выберите новость и модели для предсказания")
+# --- Классификатор ---
+st.subheader("Классификатор текста")
 
-    selected_idx = st.selectbox(
-        "Выберите новость:",
-        options=range(len(articles)),
-        format_func=lambda i: f"{articles[i]['title']} (истинная тема: {articles[i]['true_topic']})"
-    )
-    selected_article = articles[selected_idx]
+left, right = st.columns(2)
 
-    st.markdown("---")
-    st.write("**Текст новости:**")
-    st.write(selected_article["text"])
+with left:
+    source = st.radio("Источник:", ["Ввести текст", "Случайная статья"])
+    input_text = ""
 
-    st.markdown("---")
-    st.subheader("Выберите модели для сравнения")
-    selected_models = {}
-    cols = st.columns(4)
-    for i, model in enumerate(models_info):
-        with cols[i % 4]:
-            selected_models[model["name"]] = st.checkbox(model["name"], value=True)
-
-    if st.button("Сравнить модели", type="primary"):
-        if not any(selected_models.values()):
-            st.warning("Выберите хотя бы одну модель.")
+    if source == "Ввести текст":
+        input_text = st.text_area("Текст новости:", height=150)
+    else:
+        if articles:
+            idx = st.selectbox("Выбрать статью:", range(len(articles)),
+                               format_func=lambda i: articles[i].get("title", f"Статья {i}")[:80])
+            art = articles[idx]
+            input_text = art.get("title", "") + " " + art.get("text", "")
+            st.info(f"Рубрика в базе: {art.get('true_topic', '?')}")
         else:
-            results = []
-            for model_name, selected in selected_models.items():
-                if not selected:
-                    continue
-                full_text = selected_article["title"] + " " + selected_article["text"]
-                payload = {"model_name": model_name, "text": full_text}
-                resp = requests.post(f"{API_URL}/predict", json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    results.append({
-                        "Модель": model_name,
-                        "Предсказанная тема": data["predicted_category"],
-                        "Уверенность": f"{data['confidence']:.2%}"
-                    })
-                else:
-                    results.append({"Модель": model_name, "Предсказанная тема": "Ошибка", "Уверенность": "—"})
-            df_results = pd.DataFrame(results)
-            st.dataframe(df_results, use_container_width=True)
+            st.warning("Статьи не загружены")
 
-            st.subheader("Детальные вероятности для модели")
-            chosen_model = st.selectbox(
-                "Выберите модель для просмотра распределения вероятностей:",
-                [m["name"] for m in models_info if selected_models.get(m["name"], False)]
-            )
-            if chosen_model:
-                full_text = selected_article["title"] + " " + selected_article["text"]
-                payload = {"model_name": chosen_model, "text": full_text}
-                resp = requests.post(f"{API_URL}/predict", json=payload)
-                if resp.status_code == 200:
-                    probs = resp.json()["all_probabilities"]
-                    prob_df = pd.DataFrame(probs.items(), columns=["Тема", "Вероятность"])
-                    fig = px.bar(prob_df, x="Вероятность", y="Тема", orientation='h',
-                                 title=f"Вероятности – {chosen_model}")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.error("Не удалось получить вероятности")
+with right:
+    if models_list:
+        selected_model = st.selectbox("Модель:", [m["name"] for m in models_list])
 
-# ----- Вкладка 2: Статистика датасета (расширенная) -----
+        if st.button("Классифицировать"):
+            if not input_text.strip():
+                st.warning("Введите текст")
+            else:
+                with st.spinner("Анализ..."):
+                    try:
+                        resp = requests.post(f"{API_URL}/predict",
+                                             json={"model_name": selected_model, "text": input_text},
+                                             timeout=20)
+                        if resp.status_code == 200:
+                            res = resp.json()
+                            st.success(f"Рубрика: **{res.get('category', '—')}**")
+                            conf = res.get("confidence")
+                            if conf:
+                                st.write(f"Уверенность: {conf:.1%}")
+                            all_probs = res.get("all_probabilities")
+                            if all_probs:
+                                top5 = sorted(all_probs.items(), key=lambda x: x[1], reverse=True)[:5]
+                                df_p = pd.DataFrame(top5, columns=["Рубрика", "Вероятность"])
+                                fig = px.bar(df_p, x="Вероятность", y="Рубрика", orientation="h")
+                                fig.update_layout(height=220, margin=dict(l=8,r=8,t=8,b=8))
+                                st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.error(f"Ошибка API: {resp.status_code}")
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
+    else:
+        st.warning("Модели не загружены")
+
+st.divider()
+
+# --- Графики ---
+st.subheader("Статистика корпуса")
+
+tab1, tab2, tab3, tab4 = st.tabs(["По годам", "Рубрики", "Длина статей", "Рубрики: статьи vs длина"])
+
+with tab1:
+    yearly = {int(k): v for k, v in stats.get("yearly_distribution", {}).items()}
+    df_y = pd.DataFrame(list(yearly.items()), columns=["Год", "Статей"]).sort_values("Год")
+    fig = px.line(df_y, x="Год", y="Статей", title="Количество статей по годам", markers=True)
+    st.plotly_chart(fig, use_container_width=True)
+
 with tab2:
-    st.subheader("Статистика датасета Lenta.ru")
-    stats = get_statistics()
-    if stats:
-        # Общие метрики в 4 колонках
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Всего новостей", f"{stats['total_articles']:,}")
-        col2.metric("Уникальных тем", stats['unique_topics'])
-        col3.metric("Средняя длина (слова)", stats['average_text_length_words'])
-        col4.metric("Средняя длина (символы)", stats['average_text_length_chars'])
-
-        # Дополнительные статистики: минимум, максимум, медиана
-        st.write("**Распределение длины текста:**")
-        col5, col6, col7 = st.columns(3)
-        col5.metric("Минимальная длина (символы)", stats['min_length_chars'])
-        col6.metric("Максимальная длина (символы)", stats['max_length_chars'])
-        col7.metric("Медианная длина (символы)", stats['median_length_chars'])
-
-        col8, col9, col10 = st.columns(3)
-        col8.metric("Минимальная длина (слова)", stats['min_length_words'])
-        col9.metric("Максимальная длина (слова)", stats['max_length_words'])
-        col10.metric("Медианная длина (слова)", stats['median_length_words'])
-
-        st.write("**Период публикаций:**", f"{stats['date_range']['min']} — {stats['date_range']['max']}")
-
-        # Полное распределение по темам
-        st.write("**Полное распределение по темам:**")
-        topics_dict = stats['topic_distribution']
-        topic_df = pd.DataFrame(topics_dict.items(), columns=["Тема", "Количество"])
-        topic_df = topic_df.sort_values("Количество", ascending=False)
-        fig = px.bar(topic_df, x="Количество", y="Тема", orientation='h',
-                     title="Количество статей по темам (все темы)")
+    df_t = pd.DataFrame(list(stats.get("topic_distribution", {}).items()),
+                        columns=["Рубрика", "Кол-во"]).sort_values("Кол-во", ascending=False)
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.pie(df_t.head(12), values="Кол-во", names="Рубрика",
+                     title="Топ-12 рубрик", hole=0.3)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.bar(df_t.head(15).sort_values("Кол-во"), x="Кол-во", y="Рубрика",
+                     orientation="h", title="Топ-15 рубрик")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Таблица с долями
-        topic_df["Доля, %"] = (topic_df["Количество"] / stats['total_articles'] * 100).round(2)
-        st.dataframe(topic_df, use_container_width=True)
-    else:
-        st.warning("Статистика недоступна. Убедитесь, что API запущен.")
+with tab3:
+    df_l = pd.DataFrame(list(stats.get("avg_length_per_topic", {}).items()),
+                        columns=["Рубрика", "Слов"]).sort_values("Слов")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(df_l, x="Слов", y="Рубрика", orientation="h",
+                     title="Средняя длина по рубрикам")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        wc = stats.get("word_count_raw", [])
+        if wc:
+            fig = px.histogram(x=wc, nbins=50, title="Распределение длин статей",
+                               labels={"x": "Слов", "y": "Статей"})
+            st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    df_t2 = pd.DataFrame(list(stats.get("topic_distribution", {}).items()),
+                         columns=["Рубрика", "Кол-во"])
+    df_l2 = pd.DataFrame(list(stats.get("avg_length_per_topic", {}).items()),
+                         columns=["Рубрика", "Слов"])
+    df_scatter = df_t2.merge(df_l2, on="Рубрика")
+    fig = px.scatter(df_scatter, x="Кол-во", y="Слов", text="Рубрика",
+                     title="Рубрики: количество статей vs средняя длина",
+                     labels={"Кол-во": "Кол-во статей", "Слов": "Средняя длина (слов)"})
+    fig.update_traces(textposition="top center", marker=dict(size=8))
+    fig.update_layout(height=500)
+    st.plotly_chart(fig, use_container_width=True)
