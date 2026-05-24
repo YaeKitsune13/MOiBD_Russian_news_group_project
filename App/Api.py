@@ -1,8 +1,8 @@
-# api.py - оптимизированная версия (без загрузки всего датасета в RAM)
 import os
 import re
 import json
 import random
+import csv
 import joblib
 import numpy as np
 import pandas as pd
@@ -16,15 +16,17 @@ from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
 
-# ---------- Configuration ----------
-MODELS_DIR = "../Models"
-DATA_DIR = "../Resource"
+# ---------- Path configuration ----------
+# This file is inside App/ ; Models/ and Resource/ are one level up
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELS_DIR = os.path.join(BASE_DIR, "Models")
+DATA_DIR = os.path.join(BASE_DIR, "Resource")
 CSV_FILE = "lenta-ru-news.csv"
 STATS_FILE = os.path.join(DATA_DIR, "stats_cache.json")
 EXT = "pkl"
 TFIDF_EXT = "prek"
 
-# ---------- Stop words & lemmatization ----------
+# ---------- Text preprocessing ----------
 nltk.download('stopwords', quiet=True)
 RUSSIAN_STOP_WORDS = set(stopwords.words('russian'))
 RUSSIAN_STOP_WORDS.update({
@@ -53,7 +55,7 @@ def clean_and_lemmatize(text: str) -> str:
             result.append(lemma)
     return ' '.join(result)
 
-# ---------- Load models & vectorizer ----------
+# ---------- Load models ----------
 print("Loading label encoder...")
 le = joblib.load(os.path.join(MODELS_DIR, f"label_encoder.{EXT}"))
 
@@ -70,7 +72,6 @@ model_files = {
     "Final SVC (self-trained)": "final_svc_self_trained.pkl"
 }
 
-models = {}
 accuracy_scores = {
     "Logistic Regression": 0.8174,
     "Naive Bayes": 0.7800,
@@ -78,6 +79,7 @@ accuracy_scores = {
     "Final SVC (self-trained)": 0.8427,
 }
 
+models = {}
 for name, fname in model_files.items():
     path = os.path.join(MODELS_DIR, fname)
     if os.path.exists(path):
@@ -87,9 +89,9 @@ for name, fname in model_files.items():
 if not models:
     raise RuntimeError("No models loaded. Check MODELS_DIR and file names.")
 
-# ---------- Precompute statistics (only once) ----------
+# ---------- Statistics computation (with caching) ----------
 def compute_statistics():
-    """Читает CSV по частям, вычисляет статистику и сохраняет в JSON."""
+    """Reads CSV in chunks, computes stats, saves to JSON."""
     csv_path = os.path.join(DATA_DIR, CSV_FILE)
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found at {csv_path}")
@@ -102,23 +104,19 @@ def compute_statistics():
     date_min = None
     date_max = None
 
-    # Читаем CSV чанками по 50k строк
     chunk_iter = pd.read_csv(csv_path, usecols=['title', 'text', 'topic', 'date'],
                              chunksize=50000, low_memory=False)
     for chunk in chunk_iter:
-        # Объединяем title + text
         full_text = chunk['title'].fillna('') + ' ' + chunk['text'].fillna('')
         len_chars = full_text.str.len()
         len_words = full_text.str.split().str.len()
         len_chars_list.extend(len_chars.tolist())
         len_words_list.extend(len_words.tolist())
 
-        # Топики
         for topic in chunk['topic'].dropna():
             unique_topics.add(topic)
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
 
-        # Даты
         dates = pd.to_datetime(chunk['date'], errors='coerce')
         if date_min is None:
             date_min = dates.min()
@@ -128,10 +126,7 @@ def compute_statistics():
             date_max = max(date_max, dates.max())
 
         total_articles += len(chunk)
-        # Не держим chunk в памяти
-        del chunk, full_text, len_chars, len_words, dates
 
-    # Вычисляем статистику
     avg_chars = int(np.mean(len_chars_list))
     avg_words = int(np.mean(len_words_list))
     min_chars = int(np.min(len_chars_list))
@@ -164,12 +159,11 @@ def compute_statistics():
 
     return stats
 
-# Загружаем или вычисляем статистику
 if os.path.exists(STATS_FILE):
     print("Loading cached statistics...")
     with open(STATS_FILE, 'r', encoding='utf-8') as f:
         stats_cache = json.load(f)
-    # Конвертируем ключи topic_distribution обратно в int (JSON сохраняет как строки)
+    # Convert numeric values back to int (JSON loads them as int anyway)
     stats_cache["topic_distribution"] = {k: int(v) for k, v in stats_cache["topic_distribution"].items()}
     stats_cache["total_articles"] = int(stats_cache["total_articles"])
     stats_cache["unique_topics"] = int(stats_cache["unique_topics"])
@@ -178,37 +172,47 @@ else:
     stats_cache = compute_statistics()
     print("Statistics saved to JSON.")
 
-# ---------- Функция для получения случайных новостей без загрузки всего CSV ----------
+# ---------- Random articles (robust) ----------
 def get_random_articles(limit=50):
-    """Читает случайные строки из CSV, не загружая весь файл."""
+    """
+    Returns a list of random articles from the CSV using csv.DictReader.
+    Limits the text to 500 chars.
+    """
     csv_path = os.path.join(DATA_DIR, CSV_FILE)
-    # Сначала узнаем общее количество строк (без заголовка)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found at {csv_path}")
+
+    # Count total lines (excluding header)
     with open(csv_path, 'r', encoding='utf-8') as f:
         total_lines = sum(1 for _ in f) - 1
-    # Выбираем случайные индексы
-    if limit > total_lines:
-        limit = total_lines
-    random_indices = sorted(random.sample(range(1, total_lines + 1), limit))
-    # Читаем только нужные строки
-    rows = []
+    if total_lines <= 0:
+        return []
+
+    limit = min(limit, total_lines)
+    random_indices = set(random.sample(range(1, total_lines + 1), limit))
+
+    articles = []
     with open(csv_path, 'r', encoding='utf-8') as f:
-        # Пропускаем заголовок
-        f.readline()
-        current_idx = 1
-        for line in f:
-            if current_idx in random_indices:
-                parts = line.strip().split(',')
-                # Очень грубый split – для простоты. Лучше использовать csv.reader, но это быстрее.
-                # Упростим: возьмём первые 4 столбца (title, text, topic, date)
-                # На самом деле CSV может содержать запятые внутри, но для демонстрации сойдёт.
-                title = parts[0].strip('"') if len(parts) > 0 else ""
-                text = parts[1].strip('"') if len(parts) > 1 else ""
-                topic = parts[3].strip('"') if len(parts) > 3 else ""
-                rows.append({"title": title, "text": text[:500] + "..." if len(text) > 500 else text, "true_topic": topic})
-            current_idx += 1
-            if len(rows) == limit:
-                break
-    return rows
+        reader = csv.DictReader(f)
+        # Validate required columns
+        required = {'title', 'text', 'topic'}
+        if not required.issubset(reader.fieldnames):
+            missing = required - set(reader.fieldnames)
+            raise KeyError(f"CSV missing required columns: {missing}")
+
+        for idx, row in enumerate(reader, start=1):
+            if idx in random_indices:
+                title = row['title']
+                text = row['text']
+                topic = row['topic']
+                articles.append({
+                    "title": title,
+                    "text": text[:500] + "..." if len(text) > 500 else text,
+                    "true_topic": topic
+                })
+                if len(articles) == limit:
+                    break
+    return articles
 
 # ---------- FastAPI app ----------
 app = FastAPI(title="News Classifier API")
@@ -264,10 +268,10 @@ def overview():
 @app.get("/sample_articles")
 def sample_articles(limit: int = 50):
     try:
-        articles = get_random_articles(min(limit, 100))  
+        articles = get_random_articles(min(limit, 100))
         return {"articles": articles}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading CSV: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading CSV: {str(e)}")
 
 @app.get("/help")
 def help_endpoint():
@@ -283,4 +287,4 @@ def help_endpoint():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("Api:app", host="0.0.0.0", port=8000)
+    uvicorn.run("Api:app", host="0.0.0.0", port=8000, reload=True)

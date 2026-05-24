@@ -1,160 +1,306 @@
-# streamlit_app.py
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
 
+# ---------- Page config ----------
+st.set_page_config(
+    page_title="Lenta.ru News Classifier",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ---------- DARK THEME CSS (dark background, light text, cards) ----------
+st.markdown(
+    """
+    <style>
+    /* Main dark background */
+    .stApp {
+        background-color: #0e1117 !important;
+    }
+    /* Hide sidebar completely */
+    [data-testid="collapsedControl"] {
+        display: none;
+    }
+    section[data-testid="stSidebar"] {
+        display: none;
+    }
+    /* Dark cards */
+    .dashboard-card {
+        background-color: #1e2229;
+        border-radius: 12px;
+        padding: 1.2rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        margin-bottom: 1rem;
+        border: 1px solid #2d313a;
+    }
+    .metric-value {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #4c9aff;
+        line-height: 1.2;
+    }
+    .metric-label {
+        font-size: 0.85rem;
+        color: #a0aec0;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-top: 0.5rem;
+    }
+    /* Headers and text – light */
+    h1, h2, h3, .stMarkdown, label, .stTextArea label, .stSelectbox label, .stRadio label {
+        color: #e2e8f0 !important;
+    }
+    /* Input fields dark */
+    .stTextArea textarea, .stSelectbox div, .stSelectbox div[data-baseweb="select"] {
+        background-color: #1e2229;
+        color: #e2e8f0;
+        border-color: #2d313a;
+        border-radius: 8px;
+    }
+    /* Buttons */
+    .stButton button {
+        background-color: #2d6a4f;
+        color: white;
+        border-radius: 8px;
+        padding: 0.5rem 1.5rem;
+        font-weight: 600;
+        border: none;
+    }
+    .stButton button:hover {
+        background-color: #1b4d3e;
+    }
+    /* Expander */
+    .streamlit-expanderHeader {
+        background-color: #1e2229;
+        color: #e2e8f0;
+        border-radius: 8px;
+    }
+    /* Dataframe */
+    .dataframe {
+        background-color: #1e2229;
+        color: #e2e8f0;
+    }
+    hr {
+        margin: 1.5rem 0;
+        border-color: #2d313a;
+    }
+    /* Plotly charts background transparent */
+    .plotly-graph-div .main-svg {
+        background-color: transparent !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 API_URL = "http://localhost:8000"
 
-st.set_page_config(page_title="Классификатор новостей", layout="wide")
-st.title("Классификатор новостей Lenta.ru")
-st.markdown("Выберите новость из списка и модели для сравнения")
-
-# ---------- Загрузка списка моделей ----------
+# ---------- API calls ----------
 @st.cache_data(ttl=600)
 def get_models():
     try:
-        resp = requests.get(f"{API_URL}/models")
+        resp = requests.get(f"{API_URL}/models", timeout=5)
         resp.raise_for_status()
         return resp.json()
     except:
-        st.error("Не удалось подключиться к API. Запустите FastAPI на порту 8000.")
+        st.error("❌ FastAPI не запущен. Запустите `python api.py`")
         return []
 
-# ---------- Загрузка примеров новостей ----------
 @st.cache_data(ttl=3600)
-def get_sample_articles(limit=100):
+def get_sample_articles(limit=50):
     try:
-        resp = requests.get(f"{API_URL}/sample_articles", params={"limit": limit})
+        resp = requests.get(f"{API_URL}/sample_articles", params={"limit": limit}, timeout=10)
         resp.raise_for_status()
-        return resp.json()["articles"]
+        return resp.json().get("articles", [])
     except:
-        st.error("Не удалось загрузить образцы новостей.")
         return []
 
-# ---------- Загрузка статистики датасета ----------
 @st.cache_data(ttl=3600)
 def get_statistics():
     try:
-        resp = requests.get(f"{API_URL}/stats/overview")
+        resp = requests.get(f"{API_URL}/stats/overview", timeout=10)
         resp.raise_for_status()
         return resp.json()
     except:
-        st.error("Не удалось загрузить статистику.")
         return None
 
+# ---------- Load data ----------
 models_info = get_models()
 if not models_info:
     st.stop()
 
 articles = get_sample_articles(limit=100)
-if not articles:
-    st.stop()
+stats = get_statistics()
 
-# ---------- Основные вкладки ----------
-tab1, tab2 = st.tabs(["Сравнение моделей", "Статистика датасета"])
+# ---------- Dashboard Header ----------
+st.title("📰 Lenta.ru News Classifier")
+st.markdown("---")
 
-# ----- Вкладка 1: Сравнение моделей -----
-with tab1:
-    st.subheader("Выберите новость и модели для предсказания")
+# ---------- Model Selection Row (cards) ----------
+st.markdown("### 🤖 Выберите модели")
+model_cols = st.columns(len(models_info))
+selected_models = {}
+for i, model in enumerate(models_info):
+    with model_cols[i]:
+        with st.container():
+            st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+            sel = st.checkbox(
+                f"**{model['name']}**  \n{model['accuracy']:.2%} accuracy",
+                value=True,
+                key=model["name"]
+            )
+            selected_models[model["name"]] = sel
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    selected_idx = st.selectbox(
-        "Выберите новость:",
-        options=range(len(articles)),
-        format_func=lambda i: f"{articles[i]['title']} (истинная тема: {articles[i]['true_topic']})"
-    )
-    selected_article = articles[selected_idx]
+st.markdown("---")
 
-    st.markdown("---")
-    st.write("**Текст новости:**")
-    st.write(selected_article["text"])
+# ---------- Input Section ----------
+input_mode = st.radio(
+    "📰 Источник новости:",
+    ["✍️ Ввести свой текст", "📋 Выбрать из образцов"],
+    horizontal=True,
+)
 
-    st.markdown("---")
-    st.subheader("Выберите модели для сравнения")
-    selected_models = {}
-    cols = st.columns(4)
-    for i, model in enumerate(models_info):
-        with cols[i % 4]:
-            selected_models[model["name"]] = st.checkbox(model["name"], value=True)
+classification_text = ""
+true_topic = "—"
 
-    if st.button("Сравнить модели", type="primary"):
-        if not any(selected_models.values()):
-            st.warning("Выберите хотя бы одну модель.")
-        else:
+if input_mode == "✍️ Ввести свой текст":
+    classification_text = st.text_area(
+        "Введите текст новости (заголовок + содержание):",
+        height=200,
+        placeholder="Например: Сборная России по футболу выиграла чемпионат мира..."
+    ).strip()
+else:
+    if articles:
+        article_titles = [f"{a['title'][:70]}... (тема: {a['true_topic']})" for a in articles]
+        selected_idx = st.selectbox(
+            "Выберите новость из датасета:",
+            range(len(articles)),
+            format_func=lambda i: article_titles[i],
+        )
+        article = articles[selected_idx]
+        classification_text = article["title"] + " " + article["text"]
+        true_topic = article["true_topic"]
+        with st.expander("📄 Просмотреть текст новости"):
+            st.write(classification_text[:1000] + ("..." if len(classification_text) > 1000 else ""))
+    else:
+        st.warning("Образцы новостей не загружены (возможно, нет CSV).")
+        classification_text = ""
+
+# ---------- Classification Button ----------
+col_btn, _ = st.columns([1, 3])
+with col_btn:
+    classify = st.button("🚀 Классифицировать", type="primary", use_container_width=True)
+
+# ---------- Results Area ----------
+if classify:
+    if not classification_text:
+        st.warning("Пожалуйста, введите текст или выберите образец.")
+    elif not any(selected_models.values()):
+        st.warning("Выберите хотя бы одну модель.")
+    else:
+        with st.spinner("Анализ текста..."):
             results = []
+            probabilities = {}
             for model_name, selected in selected_models.items():
                 if not selected:
                     continue
-                full_text = selected_article["title"] + " " + selected_article["text"]
-                payload = {"model_name": model_name, "text": full_text}
-                resp = requests.post(f"{API_URL}/predict", json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    results.append({
-                        "Модель": model_name,
-                        "Предсказанная тема": data["predicted_category"],
-                        "Уверенность": f"{data['confidence']:.2%}"
-                    })
-                else:
-                    results.append({"Модель": model_name, "Предсказанная тема": "Ошибка", "Уверенность": "—"})
-            df_results = pd.DataFrame(results)
-            st.dataframe(df_results, use_container_width=True)
+                payload = {"model_name": model_name, "text": classification_text}
+                try:
+                    resp = requests.post(f"{API_URL}/predict", json=payload, timeout=10)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results.append({
+                            "Модель": model_name,
+                            "Категория": data["predicted_category"],
+                            "Уверенность": f"{data['confidence']:.2%}",
+                        })
+                        probabilities[model_name] = data["all_probabilities"]
+                    else:
+                        results.append({"Модель": model_name, "Категория": "Ошибка API", "Уверенность": "—"})
+                except Exception:
+                    results.append({"Модель": model_name, "Категория": "Соединение не удалось", "Уверенность": "—"})
 
-            st.subheader("Детальные вероятности для модели")
-            chosen_model = st.selectbox(
-                "Выберите модель для просмотра распределения вероятностей:",
-                [m["name"] for m in models_info if selected_models.get(m["name"], False)]
-            )
-            if chosen_model:
-                full_text = selected_article["title"] + " " + selected_article["text"]
-                payload = {"model_name": chosen_model, "text": full_text}
-                resp = requests.post(f"{API_URL}/predict", json=payload)
-                if resp.status_code == 200:
-                    probs = resp.json()["all_probabilities"]
-                    prob_df = pd.DataFrame(probs.items(), columns=["Тема", "Вероятность"])
-                    fig = px.bar(prob_df, x="Вероятность", y="Тема", orientation='h',
-                                 title=f"Вероятности – {chosen_model}")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.error("Не удалось получить вероятности")
+        # Show results
+        st.subheader("🏆 Результаты предсказания")
+        if true_topic != "—":
+            st.info(f"📌 Истинная категория (из датасета): **{true_topic}**")
+        df_res = pd.DataFrame(results)
+        st.dataframe(df_res, use_container_width=True)
 
-# ----- Вкладка 2: Статистика датасета (расширенная) -----
-with tab2:
-    st.subheader("Статистика датасета Lenta.ru")
-    stats = get_statistics()
-    if stats:
-        # Общие метрики в 4 колонках
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Всего новостей", f"{stats['total_articles']:,}")
-        col2.metric("Уникальных тем", stats['unique_topics'])
-        col3.metric("Средняя длина (слова)", stats['average_text_length_words'])
-        col4.metric("Средняя длина (символы)", stats['average_text_length_chars'])
+        # Probability distribution
+        if probabilities:
+            st.subheader("📊 Детальные вероятности")
+            chosen = st.selectbox("Модель для детализации:", list(probabilities.keys()))
+            if chosen:
+                probs = probabilities[chosen]
+                prob_df = pd.DataFrame(probs.items(), columns=["Тема", "Вероятность"])
+                prob_df = prob_df.sort_values("Вероятность", ascending=False).head(10)
+                fig = px.bar(
+                    prob_df,
+                    x="Вероятность",
+                    y="Тема",
+                    orientation='h',
+                    title=f"Топ‑10 тем – {chosen}",
+                    color="Вероятность",
+                    color_continuous_scale="blues",
+                )
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#e2e8f0",
+                    height=500,
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-        # Дополнительные статистики: минимум, максимум, медиана
-        st.write("**Распределение длины текста:**")
-        col5, col6, col7 = st.columns(3)
-        col5.metric("Минимальная длина (символы)", stats['min_length_chars'])
-        col6.metric("Максимальная длина (символы)", stats['max_length_chars'])
-        col7.metric("Медианная длина (символы)", stats['median_length_chars'])
+st.markdown("---")
 
-        col8, col9, col10 = st.columns(3)
-        col8.metric("Минимальная длина (слова)", stats['min_length_words'])
-        col9.metric("Максимальная длина (слова)", stats['max_length_words'])
-        col10.metric("Медианная длина (слова)", stats['median_length_words'])
+# ---------- Statistics Dashboard ----------
+if stats:
+    st.subheader("📈 Статистика датасета")
+    kpi_cols = st.columns(4)
+    with kpi_cols[0]:
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{stats["total_articles"]:,}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Всего новостей</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with kpi_cols[1]:
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{stats["unique_topics"]}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Уникальных тем</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with kpi_cols[2]:
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{stats["average_text_length_words"]}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Средняя длина (слова)</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with kpi_cols[3]:
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{stats["average_text_length_chars"]}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Средняя длина (символы)</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.write("**Период публикаций:**", f"{stats['date_range']['min']} — {stats['date_range']['max']}")
-
-        # Полное распределение по темам
-        st.write("**Полное распределение по темам:**")
-        topics_dict = stats['topic_distribution']
-        topic_df = pd.DataFrame(topics_dict.items(), columns=["Тема", "Количество"])
-        topic_df = topic_df.sort_values("Количество", ascending=False)
-        fig = px.bar(topic_df, x="Количество", y="Тема", orientation='h',
-                     title="Количество статей по темам (все темы)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Таблица с долями
-        topic_df["Доля, %"] = (topic_df["Количество"] / stats['total_articles'] * 100).round(2)
-        st.dataframe(topic_df, use_container_width=True)
-    else:
-        st.warning("Статистика недоступна. Убедитесь, что API запущен.")
+    # Topic distribution
+    topics = stats["topic_distribution"]
+    topic_df = pd.DataFrame(topics.items(), columns=["Тема", "Количество"])
+    topic_df = topic_df.sort_values("Количество", ascending=False)
+    fig2 = px.bar(
+        topic_df.head(15),
+        x="Количество",
+        y="Тема",
+        orientation='h',
+        title="Топ‑15 категорий",
+        color="Количество",
+        color_continuous_scale="viridis",
+    )
+    fig2.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#e2e8f0",
+        height=500,
+        yaxis={'categoryorder': 'total ascending'},
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+else:
+    st.info("Статистика недоступна. Убедитесь, что CSV-файл находится в папке `Resource/`.")
