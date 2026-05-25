@@ -26,7 +26,7 @@ models = {}
 tfidf = None
 le = None
 stats_cache = {}
-articles_cache = []  # все статьи в памяти, грузятся один раз
+articles_cache = [] 
 
 morph = pymorphy3.MorphAnalyzer()
 nltk.download('stopwords', quiet=True)
@@ -67,26 +67,26 @@ def load_models():
             p = MODELS_DIR / fname
             if p.exists():
                 models[name] = joblib.load(p)
-                print(f"✅ {name} loaded.")
+                print(f"{name} loaded.")
     except Exception as e:
-        print(f"❌ Load error: {e}")
+        print(f"Load error: {e}")
 
 
 def load_articles():
     """Грузит статьи один раз при старте и кэширует в JSON."""
     global articles_cache
     if ARTICLES_FILE.exists():
-        print("📦 Loading articles from cache...")
+        print("Loading articles from cache...")
         with open(ARTICLES_FILE, 'r', encoding='utf-8') as f:
             articles_cache = json.load(f)
-        print(f"✅ {len(articles_cache)} articles loaded from cache.")
+        print(f"{len(articles_cache)} articles loaded from cache.")
         return
 
     if not CSV_FILE.exists():
-        print("❌ CSV not found")
+        print("CSV not found")
         return
 
-    print("⏳ Reading articles from CSV (first time only)...")
+    print("Reading articles from CSV (first time only)...")
     try:
         df = pd.read_csv(CSV_FILE, low_memory=False, on_bad_lines='skip')
         df = df[['title', 'text', 'topic']].dropna()
@@ -95,22 +95,22 @@ def load_articles():
         articles_cache = sample.rename(columns={"topic": "true_topic"}).to_dict(orient="records")
         with open(ARTICLES_FILE, 'w', encoding='utf-8') as f:
             json.dump(articles_cache, f, ensure_ascii=False)
-        print(f"✅ {len(articles_cache)} articles cached.")
+        print(f"{len(articles_cache)} articles cached.")
     except Exception as e:
-        print(f"❌ Articles load error: {e}")
+        print(f"Articles load error: {e}")
 
 
 def get_stats():
     global stats_cache
     if STATS_FILE.exists():
-        print("📦 Loading stats from cache...")
+        print("Loading stats from cache...")
         with open(STATS_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
 
     if not CSV_FILE.exists():
         return {"error": "CSV missing"}
 
-    print("⏳ Processing CSV for stats (first time only)...")
+    print("Processing CSV for stats (first time only)...")
     df = pd.read_csv(CSV_FILE, usecols=['topic', 'date', 'text', 'title'], low_memory=False)
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df['wc'] = (df['title'].fillna('').str.len().div(5) + df['text'].fillna('').str.len().div(5)).astype(int)
@@ -139,7 +139,7 @@ def get_stats():
     with open(STATS_FILE, 'w', encoding='utf-8') as f:
         json.dump(stats_cache, f, ensure_ascii=False)
 
-    print("✅ Stats cached.")
+    print("Stats cached.")
     return stats_cache
 
 
@@ -148,7 +148,7 @@ async def lifespan(app: FastAPI):
     load_models()
     global stats_cache
     stats_cache = get_stats()
-    load_articles()  # грузим статьи в память при старте
+    load_articles() 
     yield
 
 
